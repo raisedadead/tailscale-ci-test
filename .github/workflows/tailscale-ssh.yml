@@ -1,0 +1,84 @@
+name: Tailscale SSH Uptime
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tagname: ${{ steps.tagname.outputs.tagname }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create a tagname
+        id: tagname
+        run: |
+          tagname=$(git rev-parse --short HEAD)-$(date +%Y%m%d)-$(date +%H%M)
+          echo "tagname=$tagname" >> $GITHUB_ENV
+          echo "tagname=$tagname" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      TS_MACHINE_NAME: ${{ secrets.TS_MACHINE_NAME }}
+      TS_USERNAME: ${{ secrets.TS_USERNAME }}
+
+    steps:
+      - name: Setup and connect to Tailscale network
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: latest
+
+      - name: Configure SSH
+        # This is a workaround to avoid the SSH warning about known hosts & strict host key checking.
+        # It's not a problem for us, because we're using Tailscale to connect.
+        run: |
+          mkdir -p ~/.ssh
+          echo "Host *
+            UserKnownHostsFile=/dev/null
+            StrictHostKeyChecking no" > ~/.ssh/config
+
+      - name: Check connection to Deployment Target
+        run: |
+          tailscale status | grep -q "$TS_MACHINE_NAME" || { echo "Machine not found"; exit 1; }
+          ssh $TS_USERNAME@$TS_MACHINE_NAME "uptime"
+
+      - name: Deploy with Docker Stack
+        env:
+          STACK_NAME: stg-api
+          RUNTIME_ENVS: ${{ secrets.RUNTIME_ENVS }}
+          DEPLOYMENT_VERSION: ${{ needs.build.outputs.tagname }}
+        run: |
+          REMOTE_USER=$TS_USERNAME
+          ssh $TS_USERNAME@$TS_MACHINE_NAME /bin/bash << EOF
+            
+            # Change to the config directory
+            cd /home/${REMOTE_USER}/docker-swarm-config/stacks/api || exit 1
+            echo "Debug: Current directory: \$(pwd)"
+            
+            # Create temp file for the environment variables
+            echo "${RUNTIME_ENVS}" > .env.tmp
+            echo "DEPLOYMENT_VERSION=${DEPLOYMENT_VERSION}" >> .env.tmp
+            
+            # Source the environment variables
+            set -a  # Automatically export all variables
+            source .env.tmp || exit 1
+            set +a
+            
+            # Clean up the temp file
+            rm -f .env.tmp
+            
+            # Verify the environment variables
+            echo "Debug: Sanity check variables: "
+            env | grep -E '^DEPLOYMENT' || echo 'Vars not found'
+            echo "Debug: Sanity check config: "
+            docker stack config -c stack-api.yml | rg 'DOMAIN' || echo 'Config not found'
+
+          EOF
+        shell: bash
