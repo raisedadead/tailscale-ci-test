@@ -52,33 +52,35 @@ jobs:
       - name: Deploy with Docker Stack
         env:
           STACK_NAME: stg-api
-          RUNTIME_ENVS: ${{ secrets.RUNTIME_ENVS }}
+          ENCRYPTED_ENV_KEYS: ${{ secrets.ENCRYPTED_ENV_KEYS }}
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
           DEPLOYMENT_VERSION: ${{ needs.build.outputs.tagname }}
         run: |
-          REMOTE_USER=$TS_USERNAME
           ssh $TS_USERNAME@$TS_MACHINE_NAME /bin/bash << EOF
-            
-            # Change to the config directory
-            cd /home/${REMOTE_USER}/docker-swarm-config/stacks/api || exit 1
-            echo "Debug: Current directory: \$(pwd)"
-            
-            # Create temp file for the environment variables
-            echo "${RUNTIME_ENVS}" > .env.tmp
-            echo "DEPLOYMENT_VERSION=${DEPLOYMENT_VERSION}" >> .env.tmp
-            
-            # Source the environment variables
-            set -a  # Automatically export all variables
-            source .env.tmp || exit 1
-            set +a
-            
-            # Clean up the temp file
-            rm -f .env.tmp
-            
-            # Verify the environment variables
-            echo "Debug: Sanity check variables: "
-            env | grep -E '^DEPLOYMENT' || echo 'Vars not found'
-            echo "Debug: Sanity check config: "
-            docker stack config -c stack-api.yml | rg 'DOMAIN' || echo 'Config not found'
 
+            cd /home/${TS_USERNAME}/docker-swarm-config/stacks/api || { echo "Failed to change directory"; exit 1; }
+            echo "Debug: Current directory: \$(pwd)"
+
+            which age || { echo "age not installed, cannot decrypt secrets"; exit 1; }
+            echo "${ENCRYPTED_ENV_KEYS}" > ${STACK_NAME}-${DEPLOYMENT_VERSION}.age.asc
+            echo "${AGE_PRIVATE_KEY}" | age-keygen --identity - | age -d -o .decypted.env ${STACK_NAME}-${DEPLOYMENT_VERSION}.age.asc
+
+            echo "DEPLOYMENT_ENV=${DEPLOYMENT_ENV}" >> .decypted.env
+            echo "DEPLOYMENT_VERSION=${DEPLOYMENT_VERSION}" >> .decypted.env
+            echo "SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT}" >> .decypted.env
+
+            set -a
+            source .decypted.env || { echo "Failed to source .decypted.env"; exit 1; }
+            set +a
+            rm -f .decypted.env
+
+            echo "Debug: Sanity check variables: "
+            env | grep -E '^DEPLOYMENT' || { echo 'Vars not found'; exit 1; }
+            echo "Debug: Sanity check config: "
+            docker stack config -c stack-api.yml | rg 'DOMAIN' || { echo 'Invalid stack config'; exit 1; }
+
+            # Dump the stack config to a file for debugging, this will be replaced with a deploy command
+            docker stack config -c stack-api.yml > /tmp/stack-api-${DEPLOYMENT_VERSION}.yml
+            
           EOF
         shell: bash
